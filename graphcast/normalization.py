@@ -145,19 +145,31 @@ class InputsAndResiduals(predictor_base.Predictor):
     else:
       return normalize(target, self._scales, self._locations)
 
-  def __call__(self,
-               inputs: xarray.Dataset,
-               targets_template: xarray.Dataset,
-               forcings: xarray.Dataset,
-               **kwargs
-               ) -> xarray.Dataset:
+  def __call__(
+      self,
+      inputs: xarray.Dataset,
+      targets_template: xarray.Dataset,
+      forcings: Optional[xarray.Dataset],
+      **kwargs,
+  ) -> Tuple[xarray.Dataset, Optional[xarray.Dataset]]:
+    """Runs the predictor and returns the unnormalized predictions."""
     norm_inputs = normalize(inputs, self._scales, self._locations)
     norm_forcings = normalize(forcings, self._scales, self._locations)
-    norm_predictions = self._predictor(
+
+    predictor_output = self._predictor(
         norm_inputs, targets_template, forcings=norm_forcings, **kwargs)
-    return xarray_tree.map_structure(
+
+    if isinstance(predictor_output, tuple):
+        norm_predictions, latent_representations = predictor_output
+    else:
+        norm_predictions = predictor_output
+        latent_representations = None
+
+    predictions = xarray_tree.map_structure(
         lambda pred: self._unnormalize_prediction_and_add_input(inputs, pred),
         norm_predictions)
+
+    return predictions, latent_representations
 
   def loss(self,
            inputs: xarray.Dataset,

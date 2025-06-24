@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Support for wrapping a general Predictor to act as a Denoiser."""
-
 import dataclasses
+import jax
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import chex
@@ -224,7 +224,7 @@ class Denoiser(base.Denoiser):
       noisy_targets: xarray.Dataset,
       noise_levels: xarray.DataArray,
       forcings: Optional[xarray.Dataset] = None,
-      **kwargs) -> xarray.Dataset:
+      **kwargs) -> Tuple[xarray.Dataset, xarray.Dataset]:
     if forcings is None: forcings = xarray.Dataset()
     forcings = forcings.assign(noisy_targets)
 
@@ -397,7 +397,7 @@ class _DenoiserArchitecture:
                inputs: xarray.Dataset,
                targets_template: xarray.Dataset,
                forcings: xarray.Dataset,
-               ) -> xarray.Dataset:
+               ) -> Tuple[xarray.Dataset, xarray.Dataset]:
     self._maybe_init(inputs)
 
     # Convert all input data into flat vectors for each of the grid nodes.
@@ -413,7 +413,6 @@ class _DenoiserArchitecture:
     (latent_mesh_nodes, latent_grid_nodes) = self._run_grid2mesh_gnn(
         grid_node_features, global_norm_conditioning
     )
-
     # Run message passing in the multimesh.
     # [num_mesh_nodes, batch, latent_size]
     updated_latent_mesh_nodes = self._run_mesh_gnn(
@@ -422,16 +421,22 @@ class _DenoiserArchitecture:
 
     # Transfer data from the mesh to the grid.
     # [num_grid_nodes, batch, output_size]
-    output_grid_nodes = self._run_mesh2grid_gnn(
+    output_grid_nodes, updated_latent_grid_nodes = self._run_mesh2grid_gnn(
         updated_latent_mesh_nodes, latent_grid_nodes, global_norm_conditioning
     )
 
     # Convert output flat vectors for the grid nodes to the format of the
     # output. [num_grid_nodes, batch, output_size] -> xarray (batch, one time
     # step, lat, lon, level, multiple vars)
-    return self._grid_node_outputs_to_prediction(
+    predictions = self._grid_node_outputs_to_prediction(
         output_grid_nodes, targets_template
     )
+
+    latent_representations = self._grid_node_latents_to_prediction(
+        updated_latent_grid_nodes, targets_template
+    )
+
+    return predictions, latent_representations
 
   def _maybe_init(self, sample_inputs: xarray.Dataset):
     """Inits everything that has a dependency on the input coordinates."""
@@ -668,8 +673,8 @@ class _DenoiserArchitecture:
 
     # Run the GNN.
     grid2mesh_out = self._grid2mesh_gnn(input_graph, global_norm_conditioning)
-    latent_mesh_nodes = grid2mesh_out.nodes["mesh_nodes"].features
-    latent_grid_nodes = grid2mesh_out.nodes["grid_nodes"].features
+    latent_mesh_nodes = grid2mesh_out[0].nodes["mesh_nodes"].features
+    latent_grid_nodes = grid2mesh_out[0].nodes["grid_nodes"].features
     return latent_mesh_nodes, latent_grid_nodes
 
   def _run_mesh_gnn(self, latent_mesh_nodes: chex.Array,
@@ -715,7 +720,7 @@ class _DenoiserArchitecture:
                          updated_latent_mesh_nodes: chex.Array,
                          latent_grid_nodes: chex.Array,
                          global_norm_conditioning: Optional[chex.Array] = None,
-                         ) -> chex.Array:
+                         ) -> tuple[chex.Array, chex.Array]:
     """Runs the mesh2grid_gnn, extracting the output grid nodes."""
 
     # Add the structural edge features of this graph. Note we don't need
@@ -747,9 +752,11 @@ class _DenoiserArchitecture:
 
     # Run the GNN.
     output_graph = self._mesh2grid_gnn(input_graph, global_norm_conditioning)
-    output_grid_nodes = output_graph.nodes["grid_nodes"].features
+    output_grid_nodes, latent_graph_m = output_graph
+    output_grid_nodes = output_grid_nodes.nodes["grid_nodes"].features
+    latent_grid_nodes = latent_graph_m.nodes["grid_nodes"].features
 
-    return output_grid_nodes
+    return output_grid_nodes, latent_grid_nodes
 
   def _inputs_to_grid_node_features_and_norm_conditioning(
       self,
@@ -812,6 +819,52 @@ class _DenoiserArchitecture:
     # to xarray `Dataset` (batch, one time step, lat, lon, level, multiple vars)
     return model_utils.stacked_to_dataset(
         grid_xarray.variable, targets_template)
+
+  def _grid_node_latents_to_prediction(
+      self,
+      grid_node_latents: chex.Array,
+      targets_template: xarray.Dataset,
+  ) -> xarray.Dataset:
+    """[num_grid_nodes, batch, latent_size] -> xarray."""
+
+    # numpy array with shape [lat_lon_node, batch, latent_features]
+    assert self._grid_lat is not None and self._grid_lon is not None
+    grid_shape = (self._grid_lat.shape[0], self._grid_lon.shape[0])
+    grid_latents_lat_lon_leading = grid_node_latents.reshape(
+        grid_shape + grid_node_latents.shape[1:])
+    dims = ("lat", "lon", "batch", "latent_features")
+
+    coords = {
+        "lat": targets_template.coords["lat"],
+        "lon": targets_template.coords["lon"],
+    }
+    if "batch" in targets_template.coords:
+      coords["batch"] = targets_template.coords["batch"]
+
+    grid_xarray_lat_lon_leading = xarray_jax.DataArray(
+        data=grid_latents_lat_lon_leading,
+        dims=dims,
+        coords=coords)
+    grid_xarray = model_utils.restore_leading_axes(grid_xarray_lat_lon_leading)
+
+    # Create a simple dataset with the latent representations
+    # We'll use the time coordinates from targets_template but create a single variable
+    # for all latent features
+    if "time" in targets_template.coords:
+        time_coords = targets_template.coords["time"]
+    else:
+        time_coords = None
+    
+    # Create a dataset with a single variable containing all latent features
+    latent_dataset = xarray.Dataset({
+        "latent_representations": grid_xarray
+    })
+    
+    # Add time coordinates if they exist in the template
+    if time_coords is not None:
+        latent_dataset = latent_dataset.assign_coords(time=time_coords)
+    
+    return latent_dataset
 
 
 def _add_batch_second_axis(data, batch_size):

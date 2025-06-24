@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+  # Copyright 2024 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -93,35 +93,43 @@ class Sampler(base.Sampler):
       inputs: xarray.Dataset,
       targets_template: xarray.Dataset,
       forcings: Optional[xarray.Dataset] = None,
-      **kwargs) -> xarray.Dataset:
+      **kwargs) -> tuple[xarray.Dataset, xarray.Dataset]:
 
     dtype = casting.infer_floating_dtype(targets_template)  # pytype: disable=wrong-arg-types
     noise_levels = jnp.array(self._noise_levels).astype(dtype)
     per_step_churn_rates = jnp.array(self._per_step_churn_rates).astype(dtype)
 
-    def denoiser(noise_level: jnp.ndarray, x: xarray.Dataset) -> xarray.Dataset:
-      """Computes D(x, sigma, y)."""
+    def denoiser(noise_level: jnp.ndarray, x: xarray.Dataset) -> tuple[xarray.Dataset, Optional[xarray.Dataset]]:
+      """Computes D(x, sigma, y) and optionally returns latent representations."""
       bcast_noise_level = xarray_jax.DataArray(
           jnp.tile(noise_level, x.sizes['batch']), dims=('batch',))
       # Estimate the expectation of the fully-denoised target x0, conditional on
       # inputs/forcings, noisy targets and their noise level:
-      return self._denoiser(
+      denoiser_output = self._denoiser(
           inputs=inputs,
           noisy_targets=x,
           noise_levels=bcast_noise_level,
           forcings=forcings)
+      
+      # Extract predictions and latent representations
+      if isinstance(denoiser_output, tuple):
+        predictions, latent_representations = denoiser_output
+        return predictions, latent_representations
+      else:
+        return denoiser_output, None
 
-    def body_fn(i: jnp.ndarray, x: xarray.Dataset) -> xarray.Dataset:
+    def body_fn(i: jnp.ndarray, state: tuple[xarray.Dataset, Optional[xarray.Dataset]]) -> tuple[xarray.Dataset, Optional[xarray.Dataset]]:
       """One iteration of the sampling algorithm.
 
       Args:
         i: Sampling iteration.
-        x: Noisy targets at iteration i, these will have noise level
-          self._noise_levels[i].
+        state: Tuple of (x, latent_representations) where x are noisy targets at iteration i.
 
       Returns:
-        Noisy targets at the next lowest noise level self._noise_levels[i+1].
+        Tuple of (next_x, final_latent_representations) where next_x are noisy targets at the next lowest noise level.
       """
+      x, _ = state
+      
       def init_noise(template):
         return noise_levels[0] * utils.spherical_white_noise_like(template)
 
@@ -161,13 +169,13 @@ class Sampler(base.Sampler):
       mid_noise_level = jnp.sqrt(noise_level * next_noise_level)
 
       mid_over_current = mid_noise_level / noise_level
-      x_denoised = denoiser(noise_level, x)
+      x_denoised, latent_denoised = denoiser(noise_level, x)
       # This turns out to be a convex combination of current and denoised x,
       # which isn't entirely apparent from the paper formulae:
       x_mid = mid_over_current * x + (1 - mid_over_current) * x_denoised
 
       next_over_current = next_noise_level / noise_level
-      x_mid_denoised = denoiser(mid_noise_level, x_mid)  # pytype: disable=wrong-arg-types
+      x_mid_denoised, latent_mid_denoised = denoiser(mid_noise_level, x_mid)  # pytype: disable=wrong-arg-types
       x_next = next_over_current * x + (1 - next_over_current) * x_mid_denoised
 
       # For the final step to noise level 0, we do an Euler update which
@@ -178,10 +186,43 @@ class Sampler(base.Sampler):
       # from noise level 0. The denoiser should just be the identity function in
       # this case, but it hasn't necessarily been trained at noise level 0 so
       # we avoid relying on this.
-      return utils.tree_where(next_noise_level == 0, x_denoised, x_next)
+      final_predictions = utils.tree_where(next_noise_level == 0, x_denoised, x_next)
+      
+      final_latent_representations = utils.tree_where(
+          next_noise_level == 0, latent_denoised, latent_mid_denoised)
+      
+      return final_predictions, final_latent_representations
 
     # Init with zeros but apply additional noise at step 0 to initialise the
     # state.
     noise_init = xarray.zeros_like(targets_template)
-    return hk.fori_loop(
-        0, len(noise_levels) - 1, body_fun=body_fn, init_val=noise_init)
+    
+    # Create initial latent representations with the expected structure
+    # The latent representations have shape (batch, lat, lon, latent_features=512)
+    # Get dtype from the first data variable in the dataset
+    first_var_dtype = next(iter(targets_template.data_vars.values())).dtype
+    
+    latent_coords = {
+        k: v for k, v in targets_template.coords.items()
+        if k in ["batch", "lat", "lon"]}
+    
+    latent_data_shape = (
+        targets_template.sizes.get("batch", 1),
+        targets_template.sizes["lat"],
+        targets_template.sizes["lon"],
+        512)
+
+    latent_init = xarray.Dataset(
+        data_vars={
+            "latent_representations": (
+                ("batch", "lat", "lon", "latent_features"),
+                jnp.zeros(latent_data_shape, dtype=first_var_dtype)
+            )
+        },
+        coords=latent_coords
+    )
+    
+    final_predictions, final_latent_representations = hk.fori_loop(
+        0, len(noise_levels) - 1, body_fun=body_fn, init_val=(noise_init, latent_init))
+    
+    return final_predictions, final_latent_representations

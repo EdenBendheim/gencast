@@ -196,7 +196,7 @@ class GenCast(predictor_base.Predictor):
       noisy_targets: xarray.Dataset,
       noise_levels: xarray.DataArray,
       forcings: Optional[xarray.Dataset] = None,
-      **kwargs) -> xarray.Dataset:
+      **kwargs) -> Tuple[xarray.Dataset, Optional[xarray.Dataset]]:
     """The preconditioned denoising function D from the paper (Eqn 7)."""
     raw_predictions = self._denoiser(
         inputs=inputs,
@@ -204,8 +204,13 @@ class GenCast(predictor_base.Predictor):
         noise_levels=noise_levels,
         forcings=forcings,
         **kwargs)
-    return (raw_predictions * self._c_out(noise_levels) +
-            noisy_targets * self._c_skip(noise_levels))
+    
+    # Extract only the predictions from the tuple (ignore latent representations)
+    predictions = raw_predictions[0] if isinstance(raw_predictions, tuple) else raw_predictions
+    latent_representations = raw_predictions[1] if isinstance(raw_predictions, tuple) else None
+    
+    return (predictions * self._c_out(noise_levels) +
+            noisy_targets * self._c_skip(noise_levels)), latent_representations
 
   def loss_and_predictions(
       self,
@@ -246,7 +251,7 @@ class GenCast(predictor_base.Predictor):
         inputs, noisy_targets, noise_levels, forcings)
 
     loss, diagnostics = losses.weighted_mse_per_level(
-        denoised_predictions,
+        denoised_predictions[0],  # Extract predictions from tuple
         targets,
         # Weights are same as we used for GraphCast.
         per_variable_weights={
@@ -272,7 +277,7 @@ class GenCast(predictor_base.Predictor):
                inputs: xarray.Dataset,
                targets_template: xarray.Dataset,
                forcings: Optional[xarray.Dataset] = None,
-               **kwargs) -> xarray.Dataset:
+               **kwargs) -> Tuple[xarray.Dataset, Optional[xarray.Dataset]]:
     if self._sampler_config is None:
       raise ValueError(
           'Sampler config must be specified to run inference on GenCast.'
@@ -281,4 +286,27 @@ class GenCast(predictor_base.Predictor):
       self._sampler = dpm_solver_plus_plus_2s.Sampler(
           self._preconditioned_denoiser, **self._sampler_config
       )
-    return self._sampler(inputs, targets_template, forcings, **kwargs)
+    
+    # Get both predictions and latent representations from sampler
+    sampler_output = self._sampler(inputs, targets_template, forcings, **kwargs)
+    
+    # Extract predictions and latent representations
+    if isinstance(sampler_output, tuple):
+      predictions, latent_representations = sampler_output
+      # Store latent representations for later access
+      self._last_latent_representations = latent_representations
+      return predictions, latent_representations
+    else:
+      predictions = sampler_output
+      self._last_latent_representations = None
+      return predictions, None
+
+  def get_last_latent_representations(self) -> Optional[xarray.Dataset]:
+    """Returns the latent representations from the last prediction call.
+    
+    Returns:
+      The latent representations as an xarray.Dataset with shape 
+      [batch, time, lat, lon, latent_features] where latent_features=512,
+      or None if no prediction has been made yet.
+    """
+    return getattr(self, '_last_latent_representations', None)

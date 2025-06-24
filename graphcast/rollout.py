@@ -13,7 +13,7 @@
 # limitations under the License.
 """Utils for rolling out models."""
 
-from typing import Iterator, Optional, Sequence
+from typing import Iterator, Optional, Sequence, Union, Tuple
 
 from absl import logging
 import chex
@@ -27,14 +27,14 @@ import xarray
 
 
 class PredictorFn(typing_extensions.Protocol):
-  """Functional version of base.Predictor.__call__ with explicit rng."""
+  """Protocol for predictor functions."""
 
   def __call__(
       self, rng: chex.PRNGKey, inputs: xarray.Dataset,
       targets_template: xarray.Dataset,
       forcings: xarray.Dataset,
       **optional_kwargs,
-      ) -> xarray.Dataset:
+      ) -> Union[xarray.Dataset, Tuple[xarray.Dataset, Optional[xarray.Dataset]]]:
     ...
 
 
@@ -160,7 +160,7 @@ def chunked_prediction_generator_multiple_runs(
       else:
         sample_forcings = None
 
-      for prediction_chunk in chunked_prediction_generator(
+      for predictions, latent_representations in chunked_prediction_generator(
           predictor_fn=predictor_fn_pmap_named_args,
           rng=sample_group_rngs,
           inputs=sample_inputs,
@@ -169,11 +169,17 @@ def chunked_prediction_generator_multiple_runs(
           pmap_devices=pmap_devices,
           **chunked_prediction_kwargs,
       ):
-        prediction_chunk.coords["sample"] = np.arange(
+        samples = np.arange(
             sample_idx.start, sample_idx.stop, sample_idx.step
         )
-        yield prediction_chunk
-        del prediction_chunk
+        predictions.coords["sample"] = samples
+        if latent_representations is not None:
+            latent_representations.coords["sample"] = samples
+            
+        yield predictions, latent_representations
+        del predictions
+        if latent_representations is not None:
+            del latent_representations
   else:
     for i in range(num_samples):
       logging.info("Sample %d/%d", i, num_samples)
@@ -190,16 +196,22 @@ def chunked_prediction_generator_multiple_runs(
         if "sample" in sample_forcings.dims:
           sample_forcings = sample_forcings.isel(sample=i, drop=True)
 
-      for prediction_chunk in chunked_prediction_generator(
+      for predictions, latent_representations in chunked_prediction_generator(
           predictor_fn=predictor_fn,
           rng=this_sample_rng,
           inputs=sample_inputs,
           targets_template=targets_template,
           forcings=sample_forcings,
           **chunked_prediction_kwargs):
-        prediction_chunk.coords["sample"] = i
-        yield prediction_chunk
-        del prediction_chunk
+            
+        predictions.coords["sample"] = i
+        if latent_representations is not None:
+            latent_representations.coords["sample"] = i
+
+        yield predictions, latent_representations
+        del predictions
+        if latent_representations is not None:
+            del latent_representations
 
 
 def chunked_prediction(
@@ -230,7 +242,7 @@ def chunked_prediction(
 
   """
   chunks_list = []
-  for prediction_chunk in chunked_prediction_generator(
+  for prediction_chunk, _ in chunked_prediction_generator(
       predictor_fn=predictor_fn,
       rng=rng,
       inputs=inputs,
@@ -251,7 +263,7 @@ def chunked_prediction_generator(
     num_steps_per_chunk: int = 1,
     verbose: bool = False,
     pmap_devices: Optional[Sequence[jax.Device]] = None
-) -> Iterator[xarray.Dataset]:
+) -> Iterator[Tuple[xarray.Dataset, Optional[xarray.Dataset]]]:
   """Outputs a long trajectory by yielding chunked predictions.
 
   Args:
@@ -342,11 +354,18 @@ def chunked_prediction_generator(
     current_forcings = current_forcings.compute()
     # Make predictions for the chunk.
     rng, this_rng = split_rng_fn(rng)
-    predictions = predictor_fn(
+    predictor_output = predictor_fn(
         rng=this_rng,
         inputs=current_inputs,
         targets_template=current_targets_template,
         forcings=current_forcings)
+
+    # Handle tuple return (predictions, latent_representations) or just predictions
+    if isinstance(predictor_output, tuple):
+        predictions, latent_representations = predictor_output
+    else:
+        predictions = predictor_output
+        latent_representations = None
 
     # In the pmapped case, profiling reveals that the predictions, forcings and
     # inputs are all copied onto a single TPU, causing OOM. To avoid this
@@ -356,6 +375,8 @@ def chunked_prediction_generator(
     # remove the device_get.
     if pmap_devices is not None:
       predictions = jax.device_get(predictions)
+      if latent_representations is not None:
+        latent_representations = jax.device_get(latent_representations)
       current_forcings = jax.device_get(current_forcings)
       current_inputs = jax.device_get(current_inputs)
 
@@ -369,11 +390,20 @@ def chunked_prediction_generator(
 
     # At this point we can assign the actual targets time coordinates.
     predictions = predictions.assign_coords(time=actual_target_time)
+    if latent_representations is not None:
+        latent_representations = latent_representations.assign_coords(time=actual_target_time)
+
     if output_datetime is not None:
       predictions.coords["datetime"] = output_datetime.isel(
           time=target_slice)
-    yield predictions
+      if latent_representations is not None:
+        latent_representations.coords["datetime"] = output_datetime.isel(time=target_slice)
+    
+    # Yield both predictions and latent representations
+    yield predictions, latent_representations
     del predictions
+    if latent_representations is not None:
+      del latent_representations
 
 
 def _get_next_inputs(

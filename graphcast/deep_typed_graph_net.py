@@ -180,7 +180,7 @@ class DeepTypedGraphNet(hk.Module):
   def __call__(self,
                input_graph: typed_graph.TypedGraph,
                global_norm_conditioning: Optional[chex.Array] = None
-               ) -> typed_graph.TypedGraph:
+               ) -> Tuple[typed_graph.TypedGraph, typed_graph.TypedGraph]:
     """Forward pass of the learnable dynamics model."""
     embedder_network, processor_networks, decoder_network = (
         self._networks_builder(input_graph, global_norm_conditioning)
@@ -192,8 +192,12 @@ class DeepTypedGraphNet(hk.Module):
     # Do `m` message passing steps in the latent graphs.
     latent_graph_m = self._process(latent_graph_0, processor_networks)
 
+    # jax.debug.print("latent_graph_m stats (mean, std): {x}", x={name: (v.features.mean(), v.features.std()) for name, v in latent_graph_m.nodes.items()})
+
     # Compute outputs from the last latent graph (if applicable).
-    return self._output(latent_graph_m, decoder_network)
+    output_graph = self._output(latent_graph_m, decoder_network)
+    
+    return (output_graph, latent_graph_m) 
 
   def _networks_builder(
       self,

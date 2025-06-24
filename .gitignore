@@ -1,0 +1,20 @@
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Python virtual environment
+graphcast-env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Data files
+*.npz
+*.nc
+stats/
+
+# Images
+*.png
+
+# Other
+requirements.txt
