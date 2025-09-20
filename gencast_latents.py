@@ -16,6 +16,8 @@ import dataclasses
 import datetime
 import math
 from typing import Optional
+import argparse
+import gcsfs
 import haiku as hk
 import jax
 import matplotlib
@@ -122,10 +124,51 @@ def plot_data(
 
 
 def main():
+    # --- New: Set up argument parser ---
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--date",
+        type=str,
+        default="2022-06-01",
+        help="The date for which to generate predictions, in YYYY-MM-DD format."
+    )
+    args = parser.parse_args()
+    # --- End of new code ---
+
     # Set paths
-    MODEL_PATH = "gencast-params-GenCast 0p25deg <2019.npz"
-    DATA_PATH = "source-era5_date-2019-03-29_res-0.25_levels-13_steps-04.nc"
+    MODEL_PATH = "GenCast 1p0deg <2019.npz"
+    # DATA_PATH is now defined by the data we load from the cloud
     STATS_DIR = "stats/"
+
+    # --- New: Code to load data from WeatherBench2 ---
+    print("Connecting to Google Cloud Storage...")
+    gcs = gcsfs.GCSFileSystem(token='anon')
+    zarr_url = 'gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr'
+    mapper = gcs.get_mapper(zarr_url)
+
+    print("Opening Zarr dataset...")
+    ds = xarray.open_zarr(mapper, consolidated=True)
+
+    # Select a specific date range (e.g., two time steps for a single day)
+    # The model requires at least two time steps for input.
+    # We select 3 to ensure we have at least one target step.
+    start_date = f"{args.date}T00:00:00"
+    end_date = f"{args.date}T12:00:00" # 3 time steps: 00:00, 06:00, 12:00
+    
+    print(f"Selecting data from {start_date} to {end_date}...")
+    example_batch = ds.sel(time=slice(start_date, end_date))
+
+    print("Coarsening data from 0.25deg to 1.0deg resolution...")
+    example_batch = example_batch.coarsen(lat=4, lon=4, boundary='trim').mean()
+    
+    # Add a batch dimension to match the expected input format
+    if 'batch' not in example_batch.dims:
+        example_batch = example_batch.expand_dims('batch', axis=0)
+
+    print("Loading data into memory...")
+    example_batch.load()
+    print("Data loaded.")
+    # --- End of new code ---
 
     # Load the model
     with open(MODEL_PATH, "rb") as f:
@@ -144,28 +187,14 @@ def main():
     print("Model description:\n", ckpt.description, "\n")
     print("Model license:\n", ckpt.license, "\n")
 
-    # Check example dataset matches model
-    def parse_file_parts(file_name):
-        return dict(part.split("-", 1) for part in file_name.split("_"))
-
-    def data_valid_for_model(file_name: str, params_file_name: str):
-        """Check data type and resolution matches."""
-        data_file_parts = parse_file_parts(file_name.removesuffix(".nc"))
-        res_matches = data_file_parts["res"].replace(".", "p") in params_file_name.lower()
-        source_matches = "Operational" in params_file_name
-        if data_file_parts["source"] == "era5":
-            source_matches = not source_matches
-        return res_matches and source_matches
-
-    assert data_valid_for_model(DATA_PATH, MODEL_PATH)
-
-    # Load weather data
-    with open(DATA_PATH, "rb") as f:
-        example_batch = xarray.load_dataset(f).compute()
+    # Load weather data - this is now handled above
+    # with open(DATA_PATH, "rb") as f:
+    #     example_batch = xarray.open_dataset(f)
 
     assert example_batch.dims["time"] >= 3  # 2 for input, >=1 for targets
 
-    print(", ".join([f"{k}: {v}" for k, v in parse_file_parts(DATA_PATH.removesuffix(".nc")).items()]))
+    # This print statement might not be as relevant, but we can keep it
+    # print(", ".join([f"{k}: {v}" for k, v in parse_file_parts(DATA_PATH.removesuffix(".nc")).items()]))
     print(example_batch)
 
     # Extract training and eval data
@@ -306,21 +335,42 @@ def main():
     print(f"Latent representations: {latent_representations.dims if latent_representations else 'None'}")
 
     # Extract second timestep first, then compute ensemble mean
-    if latent_representations and 'latent_representations' in latent_representations:
-        # First, extract the second timestep from each ensemble member
-        latent_timestep_2_all_samples = latent_representations['latent_representations'].isel(time=1)
-        
-        print("Original latent representations shape:", latent_representations['latent_representations'].shape)
+    if len(latent_chunks) > 1 and 'latent_representations' in latent_chunks[1]:
+        # First, extract the data array for the second timestep.
+        # It has a time dimension of size 1, so we squeeze it.
+        latent_timestep_2_all_samples = latent_chunks[1]['latent_representations'].squeeze('time', drop=True)
+        print("Latent representations chunks processed.")
         print("Second timestep shape (all samples):", latent_timestep_2_all_samples.shape)
-        
+
         # Now compute the ensemble mean across the 'sample' dimension
         latent_timestep_2_ensemble_mean = latent_timestep_2_all_samples.mean(dim='sample')
+
+        # --- New: Crop to USA and save ---
+        print("Cropping latent representations to the United States...")
+        # Approximate bounding box for the contiguous United States
+        lat_min, lat_max = 24, 50  # Latitude range for USA
+        lon_min, lon_max = 235, 295 # Longitude range for USA (in degrees east)
+
+        lat_indices = (latent_timestep_2_ensemble_mean['lat'] >= lat_min) & (latent_timestep_2_ensemble_mean['lat'] <= lat_max)
+        lon_indices = (latent_timestep_2_ensemble_mean['lon'] >= lon_min) & (latent_timestep_2_ensemble_mean['lon'] <= lon_max)
+
+        latent_usa = latent_timestep_2_ensemble_mean.sel(lat=lat_indices, lon=lon_indices)
         
-        # Create a new dataset with the ensemble mean of the second timestep
-        latent_timestep_2_dataset = xarray.Dataset({
-            'latent_representations': latent_timestep_2_ensemble_mean
-        })
-        
+        print("Shape of cropped USA latents:", latent_usa.shape)
+
+        # Save the cropped latents to a file
+        # Use the date from the arguments for the filename
+        output_filename = f"latent_usa_{args.date}.nc"
+        print(f"Saving USA latents to {output_filename}...")
+        latent_usa.to_netcdf(output_filename)
+        print("Save complete.")
+        # --- End of new code ---
+
+        # The full-globe dataset is no longer our primary focus
+        # latent_timestep_2_dataset = xarray.Dataset({
+        #     'latent_representations': latent_timestep_2_ensemble_mean
+        # })
+
         print("Final ensemble mean shape (second timestep only):", latent_timestep_2_ensemble_mean.shape)
         
         # Calculate memory usage (approximate)
@@ -353,10 +403,8 @@ def main():
         print(f"Mean value:               {mean_val}")
         print(f"Standard deviation:       {std_val}")
         print("--------------------------------------------------")
-        
-        
     else:
-        print("No latent representations were generated to extract second timestep.")
+        print("No latent representations were generated for the second timestep.")
 
     print("done")
 
